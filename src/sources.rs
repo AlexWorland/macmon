@@ -376,6 +376,7 @@ pub struct SocInfo {
   pub memory_gb: u8,
   pub ecpu_cores: u8,
   pub pcpu_cores: u8,
+  pub mcpu_cores: u8,
   pub ecpu_freqs: Vec<u32>,
   pub pcpu_freqs: Vec<u32>,
   pub gpu_cores: u8,
@@ -385,6 +386,11 @@ pub struct SocInfo {
 impl SocInfo {
   pub fn new() -> WithError<Self> {
     get_soc_info()
+  }
+
+  // true if M5+ chip with super cores instead of efficiency cores
+  pub fn has_mcpu(&self) -> bool {
+    self.mcpu_cores > 0
   }
 }
 
@@ -453,6 +459,24 @@ fn to_mhz(vals: Vec<u32>, scale: u32) -> Vec<u32> {
   vals.iter().map(|x| *x / scale).collect()
 }
 
+// parse number_processors string into (ecpu_cores, pcpu_cores, mcpu_cores)
+// M1-M4: "proc T:P:E" (3 fields) -> (E, P, 0)
+// M5+:   "proc T:S:E:M" (4 fields) -> (E, S, M)
+fn parse_cpu_cores(number_processors: &str) -> (u64, u64, u64) {
+  let cpu_cores = number_processors
+    .strip_prefix("proc ")
+    .unwrap_or("")
+    .split(':')
+    .map(|x| x.parse::<u64>().unwrap_or(0))
+    .collect::<Vec<_>>();
+
+  match cpu_cores.len() {
+    4 => (cpu_cores[2], cpu_cores[1], cpu_cores[3]), // M5+: total:S:E:M
+    3 => (cpu_cores[2], cpu_cores[1], 0),             // M1-M4: total:P:E
+    _ => (0, 0, 0),
+  }
+}
+
 pub fn get_soc_info() -> WithError<SocInfo> {
   let out = run_system_profiler()?;
   let mut info = SocInfo::default();
@@ -474,20 +498,9 @@ pub fn get_soc_info() -> WithError<SocInfo> {
     .unwrap_or(0);
 
   // SPHardwareDataType.0.number_processors -> "proc x:y:z" or "proc x:y:z:w"
-  let cpu_cores = out["SPHardwareDataType"][0]["number_processors"]
-    .as_str()
-    .and_then(|cores| cores.strip_prefix("proc "))
-    .unwrap_or("")
-    .split(':')
-    .map(|x| x.parse::<u64>().unwrap_or(0))
-    .collect::<Vec<_>>();
-  let (ecpu_cores, pcpu_cores) = if cpu_cores.len() == 3 {
-    (cpu_cores[2], cpu_cores[1])              // M1-M4: total:pcpu:ecpu
-  } else if cpu_cores.len() == 4 {
-    (cpu_cores[3], cpu_cores[1])              // M5+:   total:super:ecpu:perf
-  } else {
-    (0, 0) // Fallback in case of invalid data
-  };
+  let number_processors =
+    out["SPHardwareDataType"][0]["number_processors"].as_str().unwrap_or("");
+  let (ecpu_cores, pcpu_cores, mcpu_cores) = parse_cpu_cores(number_processors);
 
   // SPDisplaysDataType.0.sppci_cores
   let gpu_cores =
@@ -505,6 +518,7 @@ pub fn get_soc_info() -> WithError<SocInfo> {
   info.gpu_cores = gpu_cores as u8;
   info.ecpu_cores = ecpu_cores as u8;
   info.pcpu_cores = pcpu_cores as u8;
+  info.mcpu_cores = mcpu_cores as u8;
 
   // CPU frequencies
   for (entry, name) in IOServiceIterator::new("AppleARMIODevice")? {
@@ -986,5 +1000,49 @@ mod tests {
     assert!(parse_acc_clusters(&[]).is_none());
     // Single cluster – need both ecpu and pcpu
     assert!(parse_acc_clusters(&[1, 0, 0, 0, 0, 0, 0, 0]).is_none());
+  }
+
+  #[test]
+  fn test_parse_cpu_cores_m1_m4() {
+    // M1 Pro: "proc 10:8:2" -> 2 ecpu, 8 pcpu, 0 mcpu
+    assert_eq!(parse_cpu_cores("proc 10:8:2"), (2, 8, 0));
+    // M4: "proc 10:4:6" -> 6 ecpu, 4 pcpu, 0 mcpu
+    assert_eq!(parse_cpu_cores("proc 10:4:6"), (6, 4, 0));
+    // M3 Max: "proc 16:12:4" -> 4 ecpu, 12 pcpu, 0 mcpu
+    assert_eq!(parse_cpu_cores("proc 16:12:4"), (4, 12, 0));
+  }
+
+  #[test]
+  fn test_parse_cpu_cores_m5() {
+    // M5 Max: "proc 18:6:0:12" -> 0 ecpu, 6 pcpu(super), 12 mcpu(perf)
+    assert_eq!(parse_cpu_cores("proc 18:6:0:12"), (0, 6, 12));
+    // M5 Pro (hypothetical): "proc 14:4:0:10"
+    assert_eq!(parse_cpu_cores("proc 14:4:0:10"), (0, 4, 10));
+  }
+
+  #[test]
+  fn test_parse_cpu_cores_invalid() {
+    assert_eq!(parse_cpu_cores(""), (0, 0, 0));
+    assert_eq!(parse_cpu_cores("proc"), (0, 0, 0));
+    assert_eq!(parse_cpu_cores("garbage"), (0, 0, 0));
+    assert_eq!(parse_cpu_cores("10:8:2"), (0, 0, 0));
+    assert_eq!(parse_cpu_cores("proc 8"), (0, 0, 0));
+    // Unknown future format
+    assert_eq!(parse_cpu_cores("proc 24:6:0:12:6"), (0, 0, 0));
+  }
+
+  #[test]
+  fn test_has_mcpu() {
+    let mut soc = SocInfo::default();
+    assert!(!soc.has_mcpu());
+    soc.mcpu_cores = 12;
+    assert!(soc.has_mcpu());
+  }
+
+  #[test]
+  fn test_to_mhz() {
+    assert_eq!(to_mhz(vec![4608000, 3000000], 1000), vec![4608, 3000]);
+    assert_eq!(to_mhz(vec![3_000_000, 2_000_000], 1000 * 1000), vec![3, 2]);
+    assert_eq!(to_mhz(vec![], 1000), Vec::<u32>::new());
   }
 }

@@ -365,14 +365,25 @@ impl App {
   }
 
   fn render(&mut self, f: &mut Frame) {
-    let label_l = format!(
-      "{} ({}E+{}P+{}GPU {}GB)",
-      self.soc.chip_name,
-      self.soc.ecpu_cores,
-      self.soc.pcpu_cores,
-      self.soc.gpu_cores,
-      self.soc.memory_gb,
-    );
+    let label_l = if self.soc.has_mcpu() {
+      format!(
+        "{} ({}M+{}S+{}GPU {}GB)",
+        self.soc.chip_name,
+        self.soc.mcpu_cores,
+        self.soc.pcpu_cores,
+        self.soc.gpu_cores,
+        self.soc.memory_gb,
+      )
+    } else {
+      format!(
+        "{} ({}E+{}P+{}GPU {}GB)",
+        self.soc.chip_name,
+        self.soc.ecpu_cores,
+        self.soc.pcpu_cores,
+        self.soc.gpu_cores,
+        self.soc.memory_gb,
+      )
+    };
 
     let rows = Layout::default()
       .direction(Direction::Vertical)
@@ -391,8 +402,13 @@ impl App {
 
     // 1st row
     let (c1, c2) = h_stack(iarea[0]);
-    self.render_freq_block(f, c1, "E-CPU", &self.ecpu_freq);
-    self.render_freq_block(f, c2, "P-CPU", &self.pcpu_freq);
+    if self.soc.has_mcpu() {
+      self.render_freq_block(f, c1, "P-CPU", &self.ecpu_freq);
+      self.render_freq_block(f, c2, "S-CPU", &self.pcpu_freq);
+    } else {
+      self.render_freq_block(f, c1, "E-CPU", &self.ecpu_freq);
+      self.render_freq_block(f, c2, "P-CPU", &self.pcpu_freq);
+    }
 
     // 2nd row
     let (c1, c2) = h_stack(iarea[1]);
